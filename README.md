@@ -36,7 +36,7 @@ Fine-tune features in `net2.0` only. To ship a new release: bump the version ban
 - **Filesystem**: app code at `/opt/netportal/`, secrets/config at `/etc/netportal/backend.env`, all runtime state (labs, images, templates) at `/var/lib/netportal/`, logs at `/var/log/netportal/`.
 - **Services**: `netportal-backend` (uvicorn, 127.0.0.1:8000), `caddy` (:80, reverse-proxies `/api/*` and `/ws/*` to the backend, serves the static SPA), `postgresql`, `docker`. Plus `netportal-postboot`/`netportal-bridge-cloud-learning` (bridge-cloud network re-provisioning after reboot) and `netportal-mem-tuning` (KSM/swappiness).
 - **Install**: `deploy.sh` is an 11-stage, resumable, idempotent installer. `sudo ./netportal-X.Y.run -- -y` for fully unattended.
-- **Default NetPortal login**: `root` / `netportal` (set by the installer; tell the user to change it).
+- **Default NetPortal login**: `admin` / `netportal` (as of v5.8 — was `root` / `netportal` before that; both the install template and the live production instance were changed).
 - **Console architecture**: no Guacamole — built-in WebSocket console proxy (xterm.js/noVNC), including an admin-only real host-shell tab (added this session, server-side-enforced role gate, audit-logged).
 - **Docker images used by lab nodes**: tagged `netportal-lab/*`. The "Universal VM" node type (`netportal-pktgen:latest`) is a general-purpose test client — Firefox-via-VNC, hping3/nmap/curl/iperf3/tcpdump, and `wpa_supplicant` for 802.1X testing.
 
@@ -54,11 +54,19 @@ Fine-tune features in `net2.0` only. To ship a new release: bump the version ban
 10. **`command -v a b c` in a shell script only reliably checks the first argument** in some contexts — don't trust a multi-arg existence check without verifying each one individually first.
 11. **Docker Engine 29's `containerd-snapshotter=true`** stores image layers under `/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs`, *not* the classic `/var/lib/docker/overlay2`. If `/var/lib/docker` looks suspiciously empty after a `docker load`, check there before assuming data loss.
 12. **A `RUN ... <<'EOF' cat > file` heredoc in a classic (non-BuildKit) Dockerfile silently produces a 0-byte file.** The heredoc body doesn't make it into the `RUN` instruction's shell invocation. Use `COPY` with a separate file instead.
+13. **`curl --data-binary @bigfile` can fail with "out of memory" on large uploads** (hit this on a 3.67GB ISO) — it reads the whole file into memory before sending. Use `-T`/`--upload-file` instead, which streams from disk.
+14. **Renaming a NetPortal user's username isn't a plain `UPDATE`.** `users.username` is the primary key, and `labs.owner`/`pods.username` are foreign keys to it with `NO ACTION` (not `CASCADE`) — check with `SELECT confupdtype FROM pg_constraint WHERE confrelid = 'users'::regclass` before assuming otherwise. A direct rename violates the FK the moment any row references the old value. Safe pattern: insert a new row with the new username (copy every column, clear `session_token`/`session_expires` so a fresh login is required), repoint every dependent table's FK column, *then* delete the old row — all in one transaction. Renaming the account you're currently logged in as also invalidates that session no matter what, since the client's cookie still names the old username.
 
 ## Session log (what's been built)
 
 Chronological, most recent first. Each entry is a `net2.0` commit unless noted otherwise.
 
+- **v5.8 release** — Copy Node + Snapshot as Image + v1.1 branding + admin/netportal default, all rolled into one `.run`/GitHub release. Verified the actual release artifact (extracted the `.run`, grepped the real files) rather than just trusting the build log, since it's cheap insurance against a stale/wrong upload.
+- **Default admin credentials changed to `admin`/`netportal`** (was `root`/`netportal`) — two separate things, both done: (1) `deploy/env/backend.env.example` template fix, so future fresh installs default to `admin`; (2) the *live production instance's* actual database account renamed too, via the FK-safe transaction pattern (see landmine #14). Also fixed a real pre-existing bug: the installer's non-quiet summary hardcoded `"Username: root"` literally instead of reading the `admin_user` variable the quiet-mode summary a few lines above already computed correctly.
+- **Branding: "NetPortal v1.1"** on `/login` and `/labs` — they'd drifted apart (v4.0 vs v2.0) before this made them consistent. Purely cosmetic UI text, unrelated to the actual `deploy.sh` release version numbering.
+- **"Snapshot as Image"** — right-click a *stopped* QEMU node → flattens its current disk (config, IPs, installed packages, everything on it, not just its starting state) into a new standalone base image under `images/qemu/`, via `qemu-img convert` merging the node's COW overlay with its backing chain. Node must be stopped (enforced server-side — converting a live-written qcow2 risks a half-flushed disk); QEMU-only for now (Docker/IOL/dynamips images work completely differently); admin-gated (adds to the shared image library). Runs off the event loop (`asyncio.to_thread`) since conversion can take a while on a large disk. Verified live: snapshotted a FortiGate node with real prior state, confirmed the output has zero backing-file reference, confirmed a new node could actually be created from it.
+- **"Copy Node"** — right-click a node → creates an independent new node with the same image/cpu/ram/ethernet/console config. Not a clone: `uuid`/`firstmac` are dropped from the copied `extras` so the backend mints a fresh identity, same as any newly-created node (new id, new QEMU uuid, new MAC, starts stopped). Reuses the existing single-node-create endpoint — no backend changes needed.
+- **v5.7 release** — labs-running indicator + lab download/import + the two build scripts, rolled into one `.run`/release.
 - **Lab download/import** — `GET /api/labs/{path}/download` serves the raw lab JSON; `POST /api/labs/import` (multipart upload) creates a new lab from it, reassigning a fresh id and auto-suffixing on a filename collision. Lets a lab move between NetPortal instances. UI: a download button next to Rename/Delete on each lab card, an "Import" toolbar button.
 - **Labs-running indicator** — the folder-listing endpoint now flags each lab `running: bool` (cross-referencing `NodeRuntimeService`'s live node registry against each lab's own `id`). Labs with active nodes render with a red border/icon/badge in the `/labs` list.
 - **`deploy/scripts/build-qcow2.sh` and `build-vmware-iso.sh`** — turn the manual, hand-debugged build sessions that produced the qcow2/ISO into one-command, verified pipelines. `build-qcow2.sh` is proven (ran fully unattended end-to-end). `build-vmware-iso.sh` encodes the same commands already proven manually but hasn't been run start-to-finish as a script yet.
@@ -72,14 +80,13 @@ Chronological, most recent first. Each entry is a `net2.0` commit unless noted o
 - **802.1X/EAP-TTLS root-cause + durable fix** — a lab bridge's `group_fwd_mask` sysfs value was blocking EAPOL frames (IEEE 802.1D reserved multicast range). Fixed live, then made it self-healing: a `bridge-tune` verb in the privileged helper + a startup reconciliation pass that retunes any bridge found with a stale mask (proven by deliberately breaking one and confirming the next backend restart fixed it automatically).
 - **v5.5 release, Bridge-Cloud UX** — smaller/editable icon on bridge-cloud networks, orange link coloring (later changed to gray, see above).
 
-## Pending / not yet pushed
+## Pending
 
-As of the last update to this doc, the following are committed **locally** to a `net2.0` working clone but not yet pushed to GitHub — check `git log origin/main..HEAD` there before assuming they're live:
-- Lab download/import
-- Labs-running red indicator
-- The two build scripts
+`net2.0` is fully pushed and released as of **v5.8** — nothing sitting local-only there right now (check `git log origin/main..HEAD` in a fresh clone to be sure this hasn't drifted since).
 
-Push cadence in this project has deliberately been "commit locally, ask before pushing/releasing" — don't push or cut a release without the user asking for it by name.
+What's genuinely pending: **`netportal-qcow2`, `netportal-vmware`, and `netportal-bare` are stale** — all three were last built against v5.6 content and have not been rebuilt against v5.7 or v5.8. Concretely, none of them have Copy Node, Snapshot as Image, the v1.1 branding, or the `admin`/`netportal` default credentials yet. To bring them current: build a `.run` from the latest `net2.0` (`deploy/scripts/build-run.sh`), then run `deploy/scripts/build-qcow2.sh --run <path>` and `deploy/scripts/build-vmware-iso.sh --run <path>`, then publish all three the same way the v5.6 ones were done (see the repo table above).
+
+Push/release cadence in this project has been "commit locally, ask before pushing" for individual features, but the user has been asking for pushes/releases fairly readily once a batch of work is done — don't assume silence means "don't push," but don't push without being asked either.
 
 ## How to actually work here
 
