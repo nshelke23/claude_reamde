@@ -40,6 +40,40 @@ Fine-tune features in `net2.0` only. To ship a new release: bump the version ban
 - **Console architecture**: no Guacamole — built-in WebSocket console proxy (xterm.js/noVNC), including an admin-only real host-shell tab (added this session, server-side-enforced role gate, audit-logged).
 - **Docker images used by lab nodes**: tagged `netportal-lab/*`. The "Universal VM" node type (`netportal-pktgen:latest`) is a general-purpose test client — Firefox-via-VNC, hping3/nmap/curl/iperf3/tcpdump, and `wpa_supplicant` for 802.1X testing.
 
+## Reaching a node's console (the standard way — no new mgmt login)
+
+If you (an AI session, Claude or otherwise) need to log into a lab node directly — a router, switch, Ubuntu box, FortiGate, whatever — **don't invent a separate SSH/management account for it.** NetPortal already exposes the exact same console the browser's console tab uses, and the mechanism to reach it depends on where you're running:
+
+**Running on the NetPortal host itself** (e.g. a Claude Code session with `Bash` on the box): call the console-info endpoint to get the real host:port, then connect directly.
+
+```sh
+# 1. Log in once, keep the session cookie
+curl -s -c cookies.txt -X POST http://127.0.0.1:8000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"netportal"}'
+
+# 2. Ask for the node's actual console — same one the browser connects to
+curl -s -b cookies.txt \
+  http://127.0.0.1:8000/api/labs/<LAB>.json/nodes/<NODE_ID>/console
+# -> {"console":"telnet","host":"127.0.0.1","port":11000,
+#     "secondary_console":"vnc","secondary_console_port":5900, ...}
+
+# 3. Connect to that port directly — it's the node's real serial/telnet port,
+#    nothing NetPortal-specific about it from here on
+python3 -c "
+import telnetlib
+tn = telnetlib.Telnet('127.0.0.1', 11000, timeout=3)
+tn.write(b'\r\n')
+print(tn.read_until(b'login:', timeout=3).decode())
+"
+```
+
+Verified live against a real running node (FNAC): got the actual `fnac-pri login:` prompt this way, no separate credentials created anywhere.
+
+**Running anywhere else** (an AI hitting the NetPortal API over the network, not on the host): the `/console` endpoint's `host` is `127.0.0.1` — only useful locally. The network-reachable equivalent is the same WebSocket the browser's xterm.js console already uses: `wss://<netportal-host>/api/console/ws/<LAB>.json/<NODE_ID>`, authenticated with the same session cookie as everything else. It's the identical tunnel to the identical console — just usable off-box, by any client that speaks WebSocket + a text stream, not only the browser.
+
+**The real limitation, not a missing feature**: this works cleanly for anything with a text console — Ubuntu, switches, routers, FortiGate CLI — because telnet is a byte stream an LLM can read/write directly, same as any other CLI. It does **not** solve "drive a Windows GUI" the same way: the secondary console there is VNC, a pixel framebuffer, not text. "Taking control" of a graphical node means driving a screen an LLM can't natively read without vision/OCR in the loop — a different, harder problem than this endpoint solves. Don't assume VNC nodes are equally automatable just because the connection info is available the same way.
+
 ## Landmines already found (don't rediscover these)
 
 1. **`TopologyCanvas.svelte` contains 2 legitimate embedded NUL bytes** (a map-key delimiter). Plain `grep` on this file silently misbehaves — always use `grep -a`.
