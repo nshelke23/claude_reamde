@@ -42,41 +42,36 @@ Fine-tune features in `net2.0` only. To ship a new release: bump the version ban
 
 ## Reaching a node's console (the standard way — no new mgmt login)
 
-If you (an AI session, Claude or otherwise) need to log into a lab node directly — a router, switch, Ubuntu box, FortiGate, whatever — **don't invent a separate SSH/management account for it.** NetPortal already exposes the exact same console the browser's console tab uses, and the mechanism to reach it depends on where you're running:
+If you (an AI session, Claude or otherwise) need to log into a lab node directly — a router, switch, Ubuntu box, FortiGate, whatever — **don't invent a separate SSH/management account for it.** NetPortal already exposes the exact same console the browser's console tab uses. **Use the WebSocket endpoint, not a raw socket to the reported port** — as of the shared-console-session fix (see below), the WebSocket path is genuinely safe to use *while a human already has the same console open*; a raw direct connection to the port is not.
 
-**Running on the NetPortal host itself** (e.g. a Claude Code session with `Bash` on the box): call the console-info endpoint to get the real host:port, then connect directly.
+**Recommended, works from anywhere the WebSocket URL is reachable (on-host or remote):**
 
-```sh
-# 1. Log in once, keep the session cookie
-curl -s -c cookies.txt -X POST http://127.0.0.1:8000/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"netportal"}'
+```python
+import asyncio, websockets
 
-# 2. Ask for the node's actual console — same one the browser connects to
-curl -s -b cookies.txt \
-  http://127.0.0.1:8000/api/labs/<LAB>.json/nodes/<NODE_ID>/console
-# -> {"console":"telnet","host":"127.0.0.1","port":11000,
-#     "secondary_console":"vnc","secondary_console_port":5900, ...}
+async def main():
+    uri = "ws://127.0.0.1:8000/api/console/ws/<LAB>.json/<NODE_ID>"
+    headers = [("Cookie", "netportal_session=<TOKEN>; netportal_user=<USERNAME>")]
+    async with websockets.connect(uri, additional_headers=headers) as ws:
+        # first frame(s) are a scrollback replay if someone's already connected
+        print((await ws.recv()))
+        await ws.send(b"\r\n")
+        print((await ws.recv()))
 
-# 3. Connect to that port directly — it's the node's real serial/telnet port,
-#    nothing NetPortal-specific about it from here on
-python3 -c "
-import telnetlib
-tn = telnetlib.Telnet('127.0.0.1', 11000, timeout=3)
-tn.write(b'\r\n')
-print(tn.read_until(b'login:', timeout=3).decode())
-"
+asyncio.run(main())
 ```
 
-Verified live against a real running node (FNAC): got the actual `fnac-pri login:` prompt this way, no separate credentials created anywhere.
+(Get the session cookie the normal way: `POST /api/auth/login` with `{"username": "admin", "password": "..."}`, read `netportal_session`/`netportal_user` from the response cookies.) `websockets` is present in the backend's own venv (`/opt/netportal/backend/.venv/bin/python3`) even if not on system Python.
 
-**⚠️ Before you connect: check whether a human already has this node's console open.** Several emulated console backends (VPCS most visibly, but this isn't unique to it) accept **exactly one telnet connection at a time**. If the operator's browser console tab is already connected and you connect directly to the same port too, you are racing them for that single slot — whichever side connected first gets silently dropped with an unexplained "Good-bye" the moment the second connection lands. This has actually happened: a user reported losing their own console session the instant an AI session connected to the same node. It looked like a NetPortal auth bug; it wasn't — it's the device's own telnet server, and the fix is procedural, not code.
+**Why the WebSocket path specifically, and not the raw port**: several emulated console backends (VPCS most visibly, but not unique to it) accept **exactly one upstream connection**. This used to mean a second WebSocket viewer got a brand-new competing connection dialed for it too, racing the first for that single slot — whichever side connected first got silently dropped with an unexplained "Good-bye". A user hit this directly: they lost their own open console the instant an AI session connected to the same node. It looked like a NetPortal bug; the *symptom* was real but the *architecture* was the actual problem.
 
-The lab already has a purpose-built way to avoid this: a per-lab **"External console"** toggle in the console toolbar (`PUT /api/labs/{lab}/console-mode` with `{"external_console": true}`, read back via `GET /api/labs/{lab}/console-mode`). When it's ON, the browser's own console explicitly refuses to connect (closes `4423`) rather than race for the slot — built for handing a session to PuTTY/SecureCRT, and it applies identically here. **Flip it ON before connecting to a node's console, flip it OFF when done** to hand control back to the browser. It's lab-wide, not per-node: turning it on closes every open browser console tab in that lab, not just the one node you're about to use — so don't flip it on a lab someone is actively working across multiple nodes in without warning them first.
+**This is now fixed at the WebSocket layer** (`_SharedConsoleSession` in `backend/app/routers/console.py`): the backend holds exactly one real connection per (lab, node, console type) and fans it out to every WebSocket viewer — human browser tabs and AI sessions alike. A newly-joining viewer gets a scrollback replay, input from any viewer reaches the shared upstream, and everyone sees the same output in real time. Verified live with two concurrent viewers: neither disconnected the other, and one viewer's typed input/the device's response was visible to the other in real time. No frontend change was needed — the browser already talks to this same endpoint, so existing console tabs transparently became shared-session viewers.
 
-**Running anywhere else** (an AI hitting the NetPortal API over the network, not on the host): the `/console` endpoint's `host` is `127.0.0.1` — only useful locally. The network-reachable equivalent is the same WebSocket the browser's xterm.js console already uses: `wss://<netportal-host>/api/console/ws/<LAB>.json/<NODE_ID>`, authenticated with the same session cookie as everything else. It's the identical tunnel to the identical console — just usable off-box, by any client that speaks WebSocket + a text stream, not only the browser.
+**What this does *not* fix**: connecting directly to the raw `host:port` from `GET /nodes/{id}/console` (e.g. with `telnetlib` straight to the reported port) **bypasses the broker entirely** and still causes the original single-slot race — that endpoint exists to discover where the console lives, not as a green light to dial it yourself outside the WebSocket path. Only use that REST endpoint for discovery; connect via the WebSocket for actual interaction.
 
-**The real limitation, not a missing feature**: this works cleanly for anything with a text console — Ubuntu, switches, routers, FortiGate CLI — because telnet is a byte stream an LLM can read/write directly, same as any other CLI. It does **not** solve "drive a Windows GUI" the same way: the secondary console there is VNC, a pixel framebuffer, not text. "Taking control" of a graphical node means driving a screen an LLM can't natively read without vision/OCR in the loop — a different, harder problem than this endpoint solves. Don't assume VNC nodes are equally automatable just because the connection info is available the same way.
+**For a real external client (PuTTY/SecureCRT) that can't speak WebSocket**, or if you deliberately want the raw port instead: the lab has a per-lab **"External console"** toggle (`PUT /api/labs/{lab}/console-mode` with `{"external_console": true}`, read back via `GET /api/labs/{lab}/console-mode`). ON makes the browser's own console — and now, correspondingly, the whole WebSocket layer — refuse new connections (closes `4423`) rather than compete for the slot, freeing it for a raw client. It's lab-wide, not per-node: turning it on closes every open browser console tab in that lab. You should no longer need this for an AI session specifically now that the WebSocket path shares safely — it's for the genuinely-external-client case.
+
+**The real limitation, not a missing feature**: all of this works cleanly for anything with a text console — Ubuntu, switches, routers, FortiGate CLI — because telnet is a byte stream an LLM can read/write directly, same as any other CLI. It does **not** solve "drive a Windows GUI" the same way: the secondary console there is VNC, a pixel framebuffer, not text (and VNC servers already support multiple concurrent viewers at their own protocol layer, so the sharing problem above never applied to them). "Taking control" of a graphical node means driving a screen an LLM can't natively read without vision/OCR in the loop — a different, harder problem.
 
 ## Landmines already found (don't rediscover these)
 
